@@ -123,7 +123,97 @@ def parse_sainsburys_receipt(pdf_path: str, output_path: str) -> list[dict]:
             "Payed": float(delivery_match.group(1)),
         })
 
-    # Write xlsx
+    write_xlsx(items, output_path)
+    return items
+
+
+def parse_tesco_receipt(pdf_path: str, output_path: str) -> list[dict]:
+    """
+    Parse a Tesco receipt PDF and output an xlsx for splitting groceries.
+
+    Args:
+        pdf_path: Path to the Tesco receipt PDF.
+        output_path: Path to write the output xlsx.
+
+    Returns:
+        List of parsed item dicts.
+    """
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
+
+    # Find the start of items (after "Rest of your items")
+    items_match = re.search(r"Rest of your items", text)
+    if not items_match:
+        raise ValueError("Could not find 'Rest of your items' section in the receipt.")
+
+    items_text = text[items_match.end():]
+
+    # Stop at end of items section
+    end_match = re.search(r"Shop from this order|Order help|Rejected vouchers", items_text)
+    if end_match:
+        items_text = items_text[:end_match.start()]
+
+    raw_lines = items_text.strip().split("\n")
+
+    # Pre-filter noise lines (page headers/footers, clubcard, deal descriptions, section headers)
+    section_headers = {"Fridge", "Freezer", "Cupboard", "Bakery", "Fruit & Veg",
+                       "Drinks", "Food Cupboard"}
+    noise = re.compile(
+        r"https://www\.tesco\.com/"
+        r"|\d{2}/\d{2}/\d{4},\s+\d{2}:\d{2}\s+My orders"
+        r"|Clubcard Price"
+        r"|^Any \d+"
+    )
+    lines = []
+    for raw in raw_lines:
+        stripped = raw.strip()
+        if not stripped or stripped in section_headers or noise.search(stripped):
+            continue
+        lines.append(stripped)
+
+    items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Try to match: item name, then £price on next line, then Quantity: N
+        price_match = None
+        qty_match = None
+
+        if i + 1 < len(lines):
+            price_match = re.match(r"^£(\d+\.\d{2})$", lines[i + 1])
+        if i + 2 < len(lines):
+            qty_match = re.match(r"^Quantity:\s*(\d+)$", lines[i + 2])
+
+        if price_match and qty_match:
+            name = line
+            price = float(price_match.group(1))
+            qty = int(qty_match.group(1))
+            items.append({
+                "Item Name": name,
+                "Quantity": qty,
+                "Payed": price,
+            })
+            i += 3
+        else:
+            i += 1
+
+    # Check for delivery cost ("Pick, pack and deliver £X.XX")
+    delivery_match = re.search(r"Pick, pack and deliver\s+£(\d+\.\d{2})", text)
+    if delivery_match:
+        items.append({
+            "Item Name": "Delivery",
+            "Quantity": 1,
+            "Payed": float(delivery_match.group(1)),
+        })
+
+    write_xlsx(items, output_path)
+    return items
+
+
+def write_xlsx(items: list[dict], output_path: str) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Expense_Breakdown"
@@ -178,11 +268,26 @@ def parse_sainsburys_receipt(pdf_path: str, output_path: str) -> list[dict]:
     total = sum(item["Payed"] for item in items)
     print(f"Parsed {len(items)} items, total: £{total:.2f}")
     print(f"xlsx written to: {output_path}")
-    return items
+
+
+def detect_store(pdf_path: str) -> str:
+    with pdfplumber.open(pdf_path) as pdf:
+        first_page = pdf.pages[0].extract_text() or ""
+    if "Tesco" in first_page:
+        return "tesco"
+    if "Sainsbury" in first_page:
+        return "sainsburys"
+    raise ValueError("Could not detect store from receipt. Supported: Sainsbury's, Tesco.")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(f"Usage: python {sys.argv[0]} <receipt.pdf> <output.xlsx>")
         sys.exit(1)
-    parse_sainsburys_receipt(sys.argv[1], sys.argv[2])
+    pdf_path = sys.argv[1]
+    output_path = sys.argv[2]
+    store = detect_store(pdf_path)
+    if store == "tesco":
+        parse_tesco_receipt(pdf_path, output_path)
+    else:
+        parse_sainsburys_receipt(pdf_path, output_path)
